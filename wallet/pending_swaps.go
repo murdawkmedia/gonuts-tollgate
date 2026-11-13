@@ -142,7 +142,7 @@ func (w *Wallet) resumeOneMint(intent *storage.PendingSwapIntent) (uint64, error
 
 // resumeOneMelt checks settlement before recovering journaled NUT-08 change.
 // Paid quotes are never melted again; pending quotes remain journaled. Only
-// an unpaid quote uses the existing idempotent replay path.
+// an explicit unpaid quote uses the existing idempotent replay path.
 func (w *Wallet) resumeOneMelt(intent *storage.PendingSwapIntent) (uint64, error) {
 	var request nut05.PostMeltBolt11Request
 	if err := json.Unmarshal(intent.RequestBytes, &request); err != nil {
@@ -154,11 +154,17 @@ func (w *Wallet) resumeOneMelt(intent *storage.PendingSwapIntent) (uint64, error
 	if err != nil {
 		return 0, err
 	}
-	if state.State == nut05.Paid {
+	switch state.State {
+	case nut05.Paid:
 		return w.finishMeltResume(intent, request.Quote, state)
-	}
-	if state.State == nut05.Pending {
+	case nut05.Pending:
 		return 0, errors.New("melt remains pending; leave intent for reconciliation")
+	case nut05.Unpaid:
+		// Only an explicit UNPAID answer may use the idempotent replay path.
+		// Unknown or malformed states are not evidence that the melt was not
+		// already submitted, so they retain the intent without a POST.
+	default:
+		return 0, fmt.Errorf("melt quote state %q is not replayable; leave intent for reconciliation", state.State.String())
 	}
 	url := intent.MintURL
 	if len(url) == 0 || url[len(url)-1] != '/' {
