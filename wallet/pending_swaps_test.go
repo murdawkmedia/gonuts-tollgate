@@ -665,3 +665,71 @@ func TestResumePendingOperationsRecoversCrashedMelt(t *testing.T) {
 		t.Fatal("melt intent must be deleted after recovery")
 	}
 }
+
+// An unknown quote state is not evidence that the melt was not submitted.
+// Only an explicit UNPAID answer may replay; unknown/malformed states must
+// leave the intent and pending inputs intact and send no melt POST.
+func TestResumeMeltUnknownStateDoesNotReplay(t *testing.T) {
+	m := newSigningMint(t)
+
+	w, err := LoadWallet(Config{WalletPath: t.TempDir(), CurrentMintURL: m.server.URL})
+	if err != nil {
+		t.Fatalf("LoadWallet: %v", err)
+	}
+	defer w.Shutdown()
+
+	quote, err := w.RequestMint(64, m.server.URL)
+	if err != nil {
+		t.Fatalf("RequestMint: %v", err)
+	}
+	if _, err := w.MintTokens(quote.Quote); err != nil {
+		t.Fatalf("MintTokens: %v", err)
+	}
+
+	origMelt := postMeltBolt11
+	postMeltBolt11 = func(string, nut05.PostMeltBolt11Request) (*nut05.PostMeltQuoteBolt11Response, error) {
+		return nil, errSimulatedCrash
+	}
+	meltQuote, err := w.RequestMeltQuote(fakeMeltInvoice, m.server.URL)
+	if err != nil {
+		t.Fatalf("RequestMeltQuote: %v", err)
+	}
+	if _, err := w.Melt(meltQuote.Quote); err == nil {
+		t.Fatal("simulated crash must surface an error")
+	}
+	postMeltBolt11 = origMelt
+
+	m.meltQuoteState = "unknown"
+	recovered, failed, err := w.ResumePendingOperations()
+	if err == nil || recovered != 0 || failed != 1 {
+		t.Fatalf("unknown state resume = recovered:%d failed:%d err:%v, want a retained failure", recovered, failed, err)
+	}
+	if m.melts != 0 {
+		t.Fatalf("unknown quote state reached melt POST: %d", m.melts)
+	}
+	remaining := 0
+	for _, intent := range w.db.GetPendingSwaps() {
+		if intent.OpType == storagePendingOpMelt {
+			remaining++
+		}
+	}
+	if remaining != 1 {
+		t.Fatalf("unknown quote state retired the melt intent: %d remain", remaining)
+	}
+	if w.PendingBalance() == 0 {
+		t.Fatal("unknown quote state retired the pending melt inputs")
+	}
+
+	// A later explicit UNPAID answer is replayable and recovers normally.
+	m.meltQuoteState = "UNPAID"
+	recovered, failed, err = w.ResumePendingOperations()
+	if err != nil || recovered != 1 || failed != 0 {
+		t.Fatalf("explicit unpaid resume = recovered:%d failed:%d err:%v", recovered, failed, err)
+	}
+	if m.melts != 1 {
+		t.Fatalf("explicit unpaid replay POSTs = %d, want 1", m.melts)
+	}
+	if w.PendingBalance() != 0 {
+		t.Fatal("explicit unpaid recovery left pending inputs")
+	}
+}
